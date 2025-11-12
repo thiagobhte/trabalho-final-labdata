@@ -1,0 +1,114 @@
+# Databricks notebook source
+from pyspark.sql import functions as F
+from datetime import timedelta
+
+
+Configurações
+
+TABLE_SILVER_POSICAO = "main.labdat.silver_sptrans_posicao_geo"
+TABLE_GOLD_DIM_LINHA = "main.labdat.gold_sptrans_dim_linha"
+TABLE_GOLD_DIM_TEMPO = "main.labdat.gold_sptrans_dim_tempo"
+TABLE_GOLD_DIM_GEOLOC = "main.labdat.gold_sptrans_dim_geoloc"
+
+print("Iniciando criação das dimensões Gold...")
+print(f"Lendo base: {TABLE_SILVER_POSICAO}")
+
+
+Ler base da Silver (com geohash)
+
+df_silver = spark.table(TABLE_SILVER_POSICAO)
+display(df_silver.limit(5))
+print(f"Registros lidos da silver: {df_silver.count()}")
+
+
+Dimensão de Linhas (line_code, terminais, sentido)
+
+print("Criando dimensão de LINHA...")
+
+df_dim_linha = (
+    df_silver
+    .select(
+        "line_code",
+        "line_id",
+        "terminal_start",
+        "terminal_end",
+        "direction"
+    )
+    .dropDuplicates(["line_code", "direction"])
+    .withColumn("ingest_ts", F.current_timestamp())
+)
+
+(
+    df_dim_linha.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TABLE_GOLD_DIM_LINHA)
+)
+
+print(f"Dimensão LINHA criada: {TABLE_GOLD_DIM_LINHA}")
+print(f"Total de linhas distintas: {df_dim_linha.count()}")
+
+# =========================================================
+# 🕒 Dimensão de Tempo (com granularidade até hora)
+# =========================================================
+print("🕒 Criando dimensão de TEMPO...")
+
+min_date_row = df_silver.select(F.min("date")).collect()[0][0]
+max_date_row = df_silver.select(F.max("date")).collect()[0][0]
+
+if min_date_row and max_date_row:
+    date_range = [min_date_row + timedelta(days=x) for x in range((max_date_row - min_date_row).days + 1)]
+
+    df_dim_tempo = (
+        spark.createDataFrame([(d,) for d in date_range], ["date"])
+        .withColumn("year", F.year("date"))
+        .withColumn("month", F.month("date"))
+        .withColumn("day", F.dayofmonth("date"))
+        .withColumn("day_of_week", F.date_format("date", "E"))
+        .withColumn("ingest_ts", F.current_timestamp())
+    )
+
+    (
+        df_dim_tempo.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(TABLE_GOLD_DIM_TEMPO)
+    )
+
+    print(f"Dimensão TEMPO criada: {TABLE_GOLD_DIM_TEMPO}")
+    print(f"Período: {min_date_row} → {max_date_row} ({len(date_range)} dias)")
+else:
+    print("Nenhuma data encontrada na base Silver. Dimensão tempo não foi criada.")
+
+Dimensão Geográfica (geohash + coordenadas)
+
+print("Criando dimensão GEOLOC...")
+
+df_dim_geoloc = (
+    df_silver
+    .select("geohash", "lat", "lon")
+    .dropDuplicates(["geohash"])
+    .withColumn("ingest_ts", F.current_timestamp())
+)
+
+(
+    df_dim_geoloc.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TABLE_GOLD_DIM_GEOLOC)
+)
+
+print(f"Dimensão GEOLOC criada: {TABLE_GOLD_DIM_GEOLOC}")
+print(f"Total de geohash únicos: {df_dim_geoloc.count()}")
+
+Visualização rápida
+
+print("Amostras de cada dimensão:")
+display(df_dim_linha.limit(5))
+display(df_dim_tempo.limit(5))
+display(df_dim_geoloc.limit(5))
+
+print("Processo concluído.")
