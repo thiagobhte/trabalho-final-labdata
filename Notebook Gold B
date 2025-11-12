@@ -1,0 +1,70 @@
+# Databricks notebook source
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+Configurações
+
+TABLE_SILVER_KPIS = "main.labdat.silver_sptrans_kpis"
+TABLE_GOLD_DIM_LINHA = "main.labdat.gold_sptrans_dim_linha"
+TABLE_GOLD_DIM_TEMPO = "main.labdat.gold_sptrans_dim_tempo"
+TABLE_GOLD_FATO = "main.labdat.gold_sptrans_fato_operacional"
+
+Ler tabelas da Silver e dimensões da Gold
+
+df_kpis = spark.table(TABLE_SILVER_KPIS).alias("kpi")
+df_dim_linha = spark.table(TABLE_GOLD_DIM_LINHA).alias("linha")
+df_dim_tempo = spark.table(TABLE_GOLD_DIM_TEMPO).alias("tempo")
+
+print("Registros lidos:")
+print(f"- KPIs: {df_kpis.count()}")
+print(f"- Dim Linha: {df_dim_linha.count()}")
+print(f"- Dim Tempo: {df_dim_tempo.count()}")
+
+display(df_kpis.limit(5))
+
+Criar chaves e relacionamentos
+
+df_fato = (
+    df_kpis
+    # Join com dimensão de linha
+    .join(df_dim_linha, F.col("kpi.line_code") == F.col("linha.line_code"), "left")
+    # Join com dimensão de tempo
+    .join(df_dim_tempo, F.col("kpi.date") == F.col("tempo.date"), "left")
+    # Selecionar colunas finais (corrigindo origem dos campos)
+    .select(
+        F.col("kpi.date"),
+        F.col("tempo.year"),
+        F.col("tempo.month"),
+        F.col("tempo.day"),
+        F.col("tempo.day_of_week"),
+        F.col("kpi.hour"),
+        F.col("kpi.line_code"),
+        F.col("linha.terminal_start"),   
+        F.col("linha.terminal_end"),     
+        F.col("linha.direction"),
+        F.col("kpi.active_vehicles"),
+        F.col("kpi.avg_headway_min"),
+        F.col("kpi.avg_speed_kmh"),
+        F.col("kpi.ingest_ts").alias("ingest_ts")
+    )
+    .withColumn("id_fato", F.monotonically_increasing_id())
+    .withColumn("created_at", F.current_timestamp())
+)
+
+Salvar como tabela Delta (particionada por ano/mês)
+(
+    df_fato.write
+    .format("delta")
+    .mode("overwrite")
+    .partitionBy("year", "month")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TABLE_GOLD_FATO)
+)
+
+print("Fato operacional criado com sucesso!")
+print(f"Tabela: {TABLE_GOLD_FATO}")
+
+
+Visualização rápida
+
+display(spark.table(TABLE_GOLD_FATO).limit(10))
