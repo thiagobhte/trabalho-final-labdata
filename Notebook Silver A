@@ -1,0 +1,139 @@
+# Databricks notebook source
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+from delta.tables import DeltaTable
+
+1. Configuração de caminhos e tabelas
+
+BRONZE_PATH = "/Volumes/main/labdat/bronze/sptrans/posicao/"
+SILVER_TABLE = "main.labdat.silver_sptrans_posicao"
+
+2. Schema explícito (evita inferência lenta)
+
+schema = StructType([
+    StructField("l", ArrayType(
+        StructType([
+            StructField("c", StringType()),    # Código da linha (ex: 8000-10)
+            StructField("cl", StringType()),   # ID numérico da linha
+            StructField("lt0", StringType()),  # Terminal inicial
+            StructField("lt1", StringType()),  # Terminal final
+            StructField("sl", StringType()),   # Sentido
+            StructField("vs", ArrayType(
+                StructType([
+                    StructField("p", StringType()),   # vehicle_id
+                    StructField("a", BooleanType()),  # ativo
+                    StructField("py", DoubleType()),  # latitude
+                    StructField("px", DoubleType()),  # longitude
+                    StructField("ta", StringType())   # timestamp
+                ])
+            ))
+        ])
+    ))
+])
+
+3. Leitura da camada Bronze
+
+df_bronze = (
+    spark.read
+    .schema(schema)
+    .option("recursiveFileLookup", "true")
+    .json(BRONZE_PATH)
+)
+
+print(f"Registros lidos da Bronze: {df_bronze.count()}")
+
+4. Explosão e flatten da estrutura aninhada
+
+df_linhas = df_bronze.select(F.explode("l").alias("linha"))
+
+df_veiculos = (
+    df_linhas
+    .select(
+        F.col("linha.c").alias("line_code"),
+        F.col("linha.cl").alias("line_id"),
+        F.col("linha.lt0").alias("terminal_start"),
+        F.col("linha.lt1").alias("terminal_end"),
+        F.col("linha.sl").alias("direction"),
+        F.explode("linha.vs").alias("veic")
+    )
+)
+
+df_posicao = df_veiculos.select(
+    F.col("line_code"),
+    F.col("line_id"),
+    F.col("direction"),
+    F.col("terminal_start"),
+    F.col("terminal_end"),
+    F.col("veic.p").alias("vehicle_id"),
+    F.col("veic.a").alias("active"),
+    F.col("veic.py").alias("lat"),
+    F.col("veic.px").alias("lon"),
+    F.col("veic.ta").alias("timestamp_raw")
+)
+
+5. Limpeza e padronização
+
+df_silver = (
+    df_posicao
+    .withColumn("lat", F.col("lat").cast("double"))
+    .withColumn("lon", F.col("lon").cast("double"))
+    .withColumn("active", F.col("active").cast("boolean"))
+    .withColumn("timestamp_utc", F.to_timestamp("timestamp_raw"))
+    # Filtros de SP
+    .filter((F.col("lat") > -24.1) & (F.col("lat") < -23.2))
+    .filter((F.col("lon") > -46.9) & (F.col("lon") < -46.2))
+    .filter(F.col("vehicle_id").isNotNull())
+    .filter(F.col("timestamp_utc").isNotNull())
+    .dropDuplicates(["vehicle_id", "timestamp_utc"])
+    .withColumn("date", F.to_date("timestamp_utc"))
+    .withColumn("ingest_ts", F.current_timestamp())
+)
+
+print(f"Registros após limpeza: {df_silver.count()}")
+
+6. Escrita incremental (MERGE INTO)
+
+if spark.catalog.tableExists(SILVER_TABLE):
+    print(f"Tabela {SILVER_TABLE} já existe → atualizando registros incrementais.")
+    deltaTable = DeltaTable.forName(spark, SILVER_TABLE)
+
+    (
+        deltaTable.alias("t")
+        .merge(
+            df_silver.alias("s"),
+            "t.vehicle_id = s.vehicle_id AND t.timestamp_utc = s.timestamp_utc"
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+else:
+    print(f"Tabela {SILVER_TABLE} não existe → criando nova tabela.")
+    (
+        df_silver.write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("date")
+        .option("overwriteSchema", "true")
+        .saveAsTable(SILVER_TABLE)
+    )
+
+7. Validação final
+
+print("Tabela atualizada com sucesso!")
+
+display(
+    spark.sql(f"""
+        SELECT COUNT(*) AS total_registros, MIN(timestamp_utc) AS inicio, MAX(timestamp_utc) AS fim
+        FROM {SILVER_TABLE}
+    """)
+)
+
+display(
+    spark.sql(f"""
+        SELECT line_code, vehicle_id, active, timestamp_utc, lat, lon
+        FROM {SILVER_TABLE}
+        ORDER BY timestamp_utc DESC
+        LIMIT 20
+    """)
+)
