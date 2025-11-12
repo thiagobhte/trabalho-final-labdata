@@ -1,0 +1,66 @@
+# Databricks notebook source
+from pyspark.sql import functions as F
+
+Configurações
+
+TABLE_FATO = "main.labdat.gold_sptrans_fato_operacional"
+TABLE_GOLD_AGG = "main.labdat.gold_sptrans_agregacoes"
+
+Ler fato operacional
+
+df_fato = spark.table(TABLE_FATO)
+print(f"Registros lidos da fato: {df_fato.count()}")
+display(df_fato.limit(5))
+
+Agregações — Nível Diário por Linha
+
+df_agg_diario = (
+    df_fato
+    .groupBy("date", "line_code", "direction")
+    .agg(
+        F.avg("avg_speed_kmh").alias("velocidade_media_kmh"),
+        F.avg("avg_headway_min").alias("intervalo_medio_min"),
+        F.avg("active_vehicles").alias("veiculos_medios_ativos"),
+        F.countDistinct("hour").alias("horas_ativas_no_dia")
+    )
+    .withColumn("ano", F.year("date"))
+    .withColumn("mes", F.month("date"))
+    .withColumn("semana", F.weekofyear("date"))
+    .withColumn("ingest_ts", F.current_timestamp())
+)
+
+Agregações — Nível Horário (para heatmaps)
+
+df_agg_horario = (
+    df_fato
+    .groupBy("date", "hour", "line_code", "direction")
+    .agg(
+        F.avg("avg_speed_kmh").alias("velocidade_media_kmh"),
+        F.avg("avg_headway_min").alias("intervalo_medio_min"),
+        F.avg("active_vehicles").alias("veiculos_medios_ativos")
+    )
+    .withColumn("dia_semana", F.date_format("date", "E"))
+    .withColumn("ingest_ts", F.current_timestamp())
+)
+
+Combinar e Salvar
+
+# Unindo as duas visões (com uma coluna tipo_agregacao para distinguir)
+df_agg_diario = df_agg_diario.withColumn("tipo_agregacao", F.lit("diario"))
+df_agg_horario = df_agg_horario.withColumn("tipo_agregacao", F.lit("horario"))
+
+df_agregado = df_agg_diario.unionByName(df_agg_horario, allowMissingColumns=True)
+
+(
+    df_agregado.write
+    .format("delta")
+    .mode("overwrite")
+    .partitionBy("tipo_agregacao")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TABLE_GOLD_AGG)
+)
+
+print("Tabela de agregações Gold criada com sucesso!")
+print(f"Tabela: {TABLE_GOLD_AGG}")
+
+display(spark.table(TABLE_GOLD_AGG).limit(10))
