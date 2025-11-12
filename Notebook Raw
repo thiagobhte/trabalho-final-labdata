@@ -1,0 +1,44 @@
+# Databricks notebook source
+import requests, json
+from datetime import datetime, timezone
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, schema_of_json, from_json, col
+
+# 1) Token (Secrets)
+TOKEN = dbutils.secrets.get("sptrans", "token")
+
+# 2) Autenticação/Coleta
+BASE_URL = "http://api.olhovivo.sptrans.com.br/v2.1"
+session = requests.Session()
+session.headers.update({"User-Agent": "databricks-sptrans/1.0"})
+
+auth = session.post(f"{BASE_URL}/Login/Autenticar", params={"token": TOKEN}, timeout=20)
+auth.raise_for_status()
+if auth.text.strip().lower() != "true":
+    raise Exception(f"Falha na autenticação: {auth.text}")
+
+resp = session.get(f"{BASE_URL}/Posicao", timeout=30)
+resp.raise_for_status()
+payload = resp.json()
+
+# 3) Timestamp
+ts = datetime.now(timezone.utc).strftime("%Y/%m/%d/%H%M%S")
+
+# 4) Serverless-safe: transformar JSON->string e parsear sem RDD
+spark = SparkSession.builder.getOrCreate()
+json_str = json.dumps(payload, ensure_ascii=False)
+
+# DataFrame com 1 linha contendo o JSON bruto
+raw_df = spark.createDataFrame([(json_str,)], ["raw"])
+
+# Inferir o schema a partir do próprio JSON (sem RDD)
+sch = spark.range(1).select(schema_of_json(lit(json_str)).alias("sch")).collect()[0][0]
+
+# Aplicar o schema e explodir para colunas
+df = raw_df.select(from_json(col("raw"), sch).alias("data")).select("data.*")
+
+# 5) Gravar em Volume UC (NÃO usar dbfs:)
+path = f"/Volumes/main/labdat/bronze/sptrans/posicao/{ts}/"
+#df.coalesce(1).write.mode("overwrite").json(path)
+raw_df.coalesce(1).write.mode("overwrite").text(path)
+print(f" Gravado em: {path}")
