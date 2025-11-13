@@ -1,0 +1,92 @@
+%sql
+USE CATALOG main;
+USE SCHEMA labdat;
+CREATE VOLUME IF NOT EXISTS main.labdat.export
+COMMENT 'Volume para exportação de metadados';
+USE CATALOG main;
+USE SCHEMA labdat;
+SHOW VOLUMES;
+
+# Databricks notebook source
+#  Exportação completa de metadados do Unity Catalog (com link de download)
+
+
+from pyspark.sql import SparkSession
+import pandas as pd
+from datetime import datetime
+
+spark = SparkSession.builder.getOrCreate()
+
+#  1. Configurações
+CATALOG = "main"
+SCHEMA = "labdat"
+VOLUME_NAME = "export"
+EXPORT_DELTA_TABLE = f"{CATALOG}.{SCHEMA}.catalogo_metadados"
+CSV_FILENAME = "catalogo_metadados.csv"
+
+VOLUME_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME_NAME}"
+CSV_PATH = f"{VOLUME_PATH}/{CSV_FILENAME}"
+
+print(f"Exportando metadados para: {CSV_PATH}")
+
+#  2. Obter schemas e tabelas
+schemas_df = spark.sql(f"SHOW SCHEMAS IN {CATALOG}")
+schemas = [r[0] for r in schemas_df.collect() if r[0] != "information_schema"]
+
+metadata_rows = []
+
+for schema in schemas:
+    try:
+        tables_df = spark.sql(f"SHOW TABLES IN {CATALOG}.{schema}")
+        for t in tables_df.collect():
+            table_name = t["tableName"]
+            full_name = f"{CATALOG}.{schema}.{table_name}"
+            try:
+                detail = spark.sql(f"DESCRIBE DETAIL {full_name}").collect()[0]
+                cols = spark.sql(f"DESCRIBE {full_name}").collect()
+
+                columns_info = [
+                    f"{c['col_name']} ({c['data_type']})"
+                    for c in cols
+                    if c['col_name'] and not c['col_name'].startswith("#")
+                ]
+
+                metadata_rows.append({
+                    "catalog": CATALOG,
+                    "schema": schema,
+                    "table": table_name,
+                    "location": detail.asDict().get("location"),
+                    "format": detail.asDict().get("format"),
+                    "numFiles": detail.asDict().get("numFiles"),
+                    "sizeInBytes": detail.asDict().get("sizeInBytes"),
+                    "createdAt": str(detail.asDict().get("createdAt")),
+                    "creator": detail.asDict().get("creator"),
+                    "columns": ", ".join(columns_info),
+                    "lastUpdated": datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f" Erro em {full_name}: {e}")
+    except Exception as e:
+        print(f" Falha ao listar tabelas de {schema}: {e}")
+
+#  3. Converter para DataFrame e salvar como tabela Delta
+if not metadata_rows:
+    raise ValueError("Nenhuma tabela encontrada no catálogo.")
+
+df_metadata = spark.createDataFrame(pd.DataFrame(metadata_rows))
+df_metadata.write.mode("overwrite").format("delta").saveAsTable(EXPORT_DELTA_TABLE)
+print(f" Tabela Delta criada: {EXPORT_DELTA_TABLE}")
+
+#  4. Salvar CSV no Volume Unity Catalog
+df_metadata.toPandas().to_csv(CSV_PATH, index=False)
+print(f" CSV salvo no Volume: {CSV_PATH}")
+
+#  5. Gerar link temporário de download
+try:
+    presigned = spark.sql(f"GENERATE LINK FOR DOWNLOAD '{CSV_PATH}'")
+    display(presigned)
+    print(" Clique no link acima para baixar o CSV.")
+except Exception as e:
+    print(f" Não foi possível gerar link presignado automaticamente: {e}")
+    print(f"Você pode acessar manualmente pelo Volume: {CSV_PATH}")
+
